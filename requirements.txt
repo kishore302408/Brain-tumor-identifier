@@ -4,3 +4,4 @@ flask
 pillow
 numpy
 scikit-learn
+streamlit
