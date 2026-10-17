@@ -1,9 +1,18 @@
-import os, json
+import os, sys, json, time
 import threading
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image
+
+# ---- Tiny-instance tuning (Render free tier: 512 MB RAM, heavily throttled CPU) ----
+# Single thread + passive OpenMP waits: torch's default active spin-waiting burns
+# the whole CPU quota on a throttled instance and made inference 10-50x slower.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_WAIT_POLICY", "passive")
+os.environ.setdefault("KMP_BLOCKTIME", "0")
 
 st.set_page_config(page_title="NeuroScan Pro", page_icon="🧠", layout="wide")
 
@@ -34,9 +43,10 @@ metrics = load_metrics()
 def get_backend():
     import torch
     from nets import tf, build, target_layer
-    # Small instances share their CPU — cap threads to avoid oversubscription.
+    # One thread only: extra threads oversubscribe the tiny vCPU and OMP
+    # workers spin-wait, wasting the entire quota (see env block at top).
     try:
-        torch.set_num_threads(2)
+        torch.set_num_threads(1)
     except Exception:
         pass
     return torch, tf, build, target_layer
@@ -56,15 +66,15 @@ def load_model(name):
 @st.cache_resource(show_spinner=False)
 def warm_state():
     """Warm-up status dict — persists across Streamlit reruns and sessions."""
-    return {"phase": "starting…", "ready": False, "ok": False}
+    return {"phase": "starting…", "ready": False, "ok": False, "t0": time.time()}
 
 def _do_warmup():
     s = warm_state()
     try:
         s["phase"] = "importing PyTorch + model code…"
         get_backend()
-        s["phase"] = "loading resnet18 weights…"
-        load_model("resnet18")
+        s["phase"] = "loading mobilenet_v2 weights…"
+        load_model("mobilenet_v2")  # warm the default model (lighter than resnet18)
         s.update(phase="ready", ready=True, ok=True)
         print("[warmup] backend ready", flush=True)
     except Exception as e:
@@ -135,10 +145,11 @@ with st.sidebar:
                                      "than ResNet18 (95.13%) on the free tier.")
     show_features = st.toggle("Show parametric features", value=True)
     show_seg = st.toggle("Show tumor localisation mask (approx.)", value=False)
-    fast_mode = st.toggle("⚡ Fast mode (skip Grad-CAM)", value=False,
-                          help="Probabilities only, no heatmap — roughly 3× faster.")
-    st.caption("⏱️ Free-tier speed: MobileNetV2 ≈ 10–20s per scan · ResNet18 ≈ 30–60s · "
-               "Fast mode ≈ 3× quicker · Ensemble runs all three models.")
+    fast_mode = st.toggle("⚡ Fast mode (skip Grad-CAM)", value=True,
+                          help="Probabilities only, no heatmap — much lighter on the free tier. "
+                               "Turn OFF to also get Grad-CAM heatmaps (noticeably slower).")
+    st.caption("⏱️ Fast mode (default) finishes in seconds. Turning it off adds Grad-CAM "
+               "heatmaps but takes much longer on the free tier. Ensemble runs all three models.")
     uploaded = st.file_uploader("Upload MRI images", type=["jpg", "jpeg", "png"],
                                 accept_multiple_files=True)
     analyze = st.button("🔍 Analyze scans", type="primary",
@@ -157,6 +168,18 @@ with st.sidebar:
     else:
         st.caption("⚡ Backend ready — analysis will be fast" if warm_state().get("ok")
                    else "ℹ️ Backend will load on first analysis.")
+
+    # Live diagnostics: memory headroom, uptime (detects OOM restarts), torch build.
+    # Never imports torch here (that would block the page) — only reads if already loaded.
+    try:
+        with open("/proc/self/status") as _fh:
+            _rss = next((int(l.split()[1]) // 1024 for l in _fh if l.startswith("VmRSS:")), None)
+    except Exception:
+        _rss = None
+    _tv = sys.modules.get("torch")
+    _up = int(time.time() - warm_state().get("t0", time.time()))
+    st.caption(f"🖥️ RAM ~{_rss or '?'} MB · up {_up}s"
+               + (f" · torch {_tv.__version__}" if _tv else ""))
 
 # ---------------- Model performance (instant) ----------------
 st.subheader("📊 Model Performance")
@@ -204,7 +227,7 @@ if analyze and uploaded:
     total = len(uploaded)
     for ui, f in enumerate(uploaded):
         img = Image.open(f).convert("RGB")
-        img.thumbnail((1024, 1024), RESAMPLE)  # keep CPU/memory low on the free tier
+        img.thumbnail((768, 768), RESAMPLE)  # keep CPU/memory low on the free tier
         x = tf(img).unsqueeze(0)
         per_model, cams = {}, {}
         for mi, n in enumerate(selected):
@@ -302,4 +325,4 @@ if "results" in st.session_state and st.session_state["results"]:
     st.caption("⚠️ Educational tool for the MED-02 challenge — not a medical device and not "
                "for diagnostic use.")
 
-st.caption("build 2026-10-17e · mobilenet default + fast mode")
+st.caption("build 2026-10-17f · single-thread OMP (no spin-wait) · fast mode default · live diagnostics")
