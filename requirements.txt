@@ -3,5 +3,6 @@ torchvision
 flask
 pillow
 numpy
+pandas
 scikit-learn
 streamlit
