@@ -138,18 +138,19 @@ with st.sidebar:
     analyze = st.button("🔍 Analyze scans", type="primary",
                         disabled=not uploaded, use_container_width=True)
 
-    @st.fragment(run_every=5)
-    def backend_status():
-        """Live indicator — updates itself while the backend preloads."""
-        s = warm_state()
-        if not s.get("ready"):
-            st.caption(f"⏳ Preloading AI backend — {s.get('phase', '…')}")
-        elif s.get("ok"):
-            st.caption("⚡ Backend ready — analysis will be fast")
-        else:
-            st.caption("ℹ️ Backend will load on first analysis.")
-
-    backend_status()
+    if not warm_state().get("ready"):
+        @st.fragment(run_every=5)
+        def backend_status():
+            """Live indicator — polls only while the backend is still preloading."""
+            s = warm_state()
+            if not s.get("ready"):
+                st.caption(f"⏳ Preloading AI backend — {s.get('phase', '…')}")
+            else:
+                st.caption("⚡ Backend ready — analysis will be fast")
+        backend_status()
+    else:
+        st.caption("⚡ Backend ready — analysis will be fast" if warm_state().get("ok")
+                   else "ℹ️ Backend will load on first analysis.")
 
 # ---------------- Model performance (instant) ----------------
 st.subheader("📊 Model Performance")
@@ -169,18 +170,14 @@ if metrics:
             with cc1:
                 st.markdown("**Confusion matrix**")
                 cm = pd.DataFrame(m["confusion"], index=CLASSES, columns=CLASSES)
-                try:
-                    st.dataframe(cm.style.background_gradient(cmap="Oranges").format("{:g}"))
-                except Exception:
-                    st.dataframe(cm)  # fallback if matplotlib is unavailable
+                st.dataframe(cm)  # plain table — no matplotlib (keeps memory low on the free tier)
             with cc2:
                 st.markdown("**Classification report**")
                 rows = [c for c in CLASSES if c in rep] + ["macro avg", "weighted avg"]
                 rep_df = pd.DataFrame(
                     {c: {k: rep[c][k] for k in ("precision", "recall", "f1-score", "support")}
                      for c in rows}).T
-                st.dataframe(rep_df.style.format({"precision": "{:.3f}", "recall": "{:.3f}",
-                                                  "f1-score": "{:.3f}", "support": "{:.0f}"}))
+                st.dataframe(rep_df.round(3))
 else:
     st.info("Run train.py first to generate metrics.")
 
@@ -191,7 +188,12 @@ if analyze and uploaded:
     progress = st.progress(0.0, text=(
         f"Preparing AI backend — {w.get('phase', '…')}" if not w.get("ready")
         else "Backend ready — starting analysis…"))
-    torch, tf, _, _ = get_backend()  # blocks only if warm-up is still running
+    try:
+        torch, tf, _, _ = get_backend()  # blocks only if warm-up is still running
+    except Exception as e:
+        st.error(f"Could not start the AI backend ({type(e).__name__}). "
+                 "Please try again in a moment.")
+        st.stop()
     results = []
     total = len(uploaded)
     for ui, f in enumerate(uploaded):
@@ -207,7 +209,11 @@ if analyze and uploaded:
                 st.warning(f"No trained weights found for {n} — skipped.")
                 continue
             progress.progress(frac, text=f"Analyzing {f.name} with {n} (Grad-CAM)…")
-            p, cam = gradcam(m, n, x)
+            try:
+                p, cam = gradcam(m, n, x)
+            except Exception as e:
+                st.error(f"{n} failed on {f.name}: {type(e).__name__} — skipped.")
+                continue
             per_model[n] = {"label": CLASSES[int(p.argmax())], "conf": float(p.max()),
                             "probs": {c: float(v) for c, v in zip(CLASSES, p.tolist())}}
             cams[n] = cam
