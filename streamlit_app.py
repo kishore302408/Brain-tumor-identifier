@@ -123,7 +123,10 @@ if metrics:
             with cc1:
                 st.markdown("**Confusion matrix**")
                 cm = pd.DataFrame(m["confusion"], index=CLASSES, columns=CLASSES)
-                st.dataframe(cm.style.background_gradient(cmap="Oranges").format("{:g}"))
+                try:
+                    st.dataframe(cm.style.background_gradient(cmap="Oranges").format("{:g}"))
+                except Exception:
+                    st.dataframe(cm)  # fallback if matplotlib is unavailable
             with cc2:
                 st.markdown("**Classification report**")
                 rows = [c for c in CLASSES if c in rep] + ["macro avg", "weighted avg"]
