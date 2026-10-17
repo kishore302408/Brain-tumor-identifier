@@ -9,7 +9,8 @@ st.set_page_config(page_title="NeuroScan Pro", page_icon="🧠", layout="wide")
 
 CLASSES = ["glioma", "meningioma", "notumor", "pituitary"]
 NAMES = ["cnn", "resnet18", "mobilenet_v2"]
-MODEL_CHOICES = ["resnet18 (best)", "mobilenet_v2", "cnn", "All + Ensemble"]
+MODEL_CHOICES = ["mobilenet_v2 (fast · 95.00%)", "resnet18 (best accuracy · 95.13%)",
+                 "cnn (baseline · 80.13%)", "All + Ensemble"]
 RESAMPLE = getattr(Image, "Resampling", Image).BICUBIC
 
 st.title("🧠 NeuroScan Pro — Brain Tumor MRI Classification")
@@ -130,9 +131,14 @@ def parametric_features(img):
 with st.sidebar:
     st.header("⚙️ Settings")
     model_choice = st.selectbox("Model", MODEL_CHOICES, index=0,
-                                help="ResNet18 achieved 95.13% test accuracy")
+                                help="MobileNetV2 gives 95.00% accuracy and runs ~3× faster "
+                                     "than ResNet18 (95.13%) on the free tier.")
     show_features = st.toggle("Show parametric features", value=True)
     show_seg = st.toggle("Show tumor localisation mask (approx.)", value=False)
+    fast_mode = st.toggle("⚡ Fast mode (skip Grad-CAM)", value=False,
+                          help="Probabilities only, no heatmap — roughly 3× faster.")
+    st.caption("⏱️ Free-tier speed: MobileNetV2 ≈ 10–20s per scan · ResNet18 ≈ 30–60s · "
+               "Fast mode ≈ 3× quicker · Ensemble runs all three models.")
     uploaded = st.file_uploader("Upload MRI images", type=["jpg", "jpeg", "png"],
                                 accept_multiple_files=True)
     analyze = st.button("🔍 Analyze scans", type="primary",
@@ -208,15 +214,26 @@ if analyze and uploaded:
             if m is None:
                 st.warning(f"No trained weights found for {n} — skipped.")
                 continue
-            progress.progress(frac, text=f"Analyzing {f.name} with {n} (Grad-CAM)…")
-            try:
-                p, cam = gradcam(m, n, x)
-            except Exception as e:
-                st.error(f"{n} failed on {f.name}: {type(e).__name__} — skipped.")
-                continue
+            p, cam = None, None
+            if fast_mode:
+                progress.progress(frac, text=f"Analyzing {f.name} with {n} (fast mode)…")
+                try:
+                    with torch.no_grad():
+                        p = m(x).softmax(1)[0]
+                except Exception as e:
+                    st.error(f"{n} failed on {f.name}: {type(e).__name__} — skipped.")
+                    continue
+            else:
+                progress.progress(frac, text=f"Analyzing {f.name} with {n} (Grad-CAM)…")
+                try:
+                    p, cam = gradcam(m, n, x)
+                except Exception as e:
+                    st.error(f"{n} failed on {f.name}: {type(e).__name__} — skipped.")
+                    continue
             per_model[n] = {"label": CLASSES[int(p.argmax())], "conf": float(p.max()),
                             "probs": {c: float(v) for c, v in zip(CLASSES, p.tolist())}}
-            cams[n] = cam
+            if cam is not None:
+                cams[n] = cam
         entry = {"name": f.name, "original": img, "models": per_model, "cams": cams}
         if len(per_model) > 1:
             avg = np.mean([list(v["probs"].values()) for v in per_model.values()], axis=0)
@@ -248,8 +265,13 @@ if "results" in st.session_state and st.session_state["results"]:
             st.image(r["original"], caption="Original scan")
         for i, (n, mres) in enumerate(r["models"].items()):
             with cols[i + 1]:
-                heat = r.get("overlays", {}).get(n) or overlay(r["original"], r["cams"][n])
-                st.image(heat, caption=f"{n}: {mres['label']} · {mres['conf']:.1%}")
+                heat = r.get("overlays", {}).get(n)
+                if heat is None and n in r.get("cams", {}):
+                    heat = overlay(r["original"], r["cams"][n])
+                if heat is not None:
+                    st.image(heat, caption=f"{n}: {mres['label']} · {mres['conf']:.1%}")
+                else:  # fast mode — no heatmap
+                    st.image(r["original"], caption=f"{n}: {mres['label']} · {mres['conf']:.1%}")
                 st.bar_chart(pd.Series(mres["probs"], name="probability"))
         if show_seg and r.get("seg"):
             s = r["seg"]
@@ -279,3 +301,5 @@ if "results" in st.session_state and st.session_state["results"]:
     st.markdown("---")
     st.caption("⚠️ Educational tool for the MED-02 challenge — not a medical device and not "
                "for diagnostic use.")
+
+st.caption("build 2026-10-17e · mobilenet default + fast mode")
