@@ -1,4 +1,5 @@
 import os, json
+import threading
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -32,6 +33,11 @@ metrics = load_metrics()
 def get_backend():
     import torch
     from nets import tf, build, target_layer
+    # Small instances share their CPU — cap threads to avoid oversubscription.
+    try:
+        torch.set_num_threads(2)
+    except Exception:
+        pass
     return torch, tf, build, target_layer
 
 @st.cache_resource
@@ -43,6 +49,24 @@ def load_model(name):
     m = build(name)
     m.load_state_dict(torch.load(path, map_location="cpu"))
     return m.eval()
+
+# ---------------- Warm-up: load torch + default model in the background so the
+# first "Analyze" click is instant instead of waiting10-20s ----------------
+@st.cache_resource(show_spinner=False)
+def _warmup():
+    try:
+        get_backend()
+        load_model("resnet18")
+    except Exception:
+        return False
+    return True
+
+@st.cache_resource(show_spinner=False)
+def _kick_warmup():
+    threading.Thread(target=_warmup, daemon=True).start()
+    return True
+
+_kick_warmup()  # runs once per server process, non-blocking
 
 def gradcam(m, name, x):
     torch, _, _, target_layer = get_backend()
@@ -103,7 +127,8 @@ with st.sidebar:
                                 accept_multiple_files=True)
     analyze = st.button("🔍 Analyze scans", type="primary",
                         disabled=not uploaded, use_container_width=True)
-    st.caption("ℹ️ Free tier: the first analysis may take 1–2 minutes while the model loads.")
+    st.caption("⚡ Models preload in the background — analysis is fast. "
+               "First visit after idle may still take ~1 minute to wake up.")
 
 # ---------------- Model performance (instant) ----------------
 st.subheader("📊 Model Performance")
@@ -147,6 +172,7 @@ if analyze and uploaded:
     for ui, f in enumerate(uploaded):
         torch, tf, _, _ = get_backend()
         img = Image.open(f).convert("RGB")
+        img.thumbnail((1024, 1024), RESAMPLE)  # keep CPU/memory low on the free tier
         x = tf(img).unsqueeze(0)
         per_model, cams = {}, {}
         for mi, n in enumerate(selected):
@@ -165,6 +191,14 @@ if analyze and uploaded:
             avg = np.mean([list(v["probs"].values()) for v in per_model.values()], axis=0)
             entry["ensemble"] = {"label": CLASSES[int(avg.argmax())], "conf": float(avg.max()),
                                  "probs": {c: float(v) for c, v in zip(CLASSES, avg.tolist())}}
+        # Precompute display artefacts once — every later rerun then renders instantly
+        entry["overlays"] = {n: overlay(img, cam) for n, cam in cams.items()}
+        if show_seg and cams and per_model:
+            best = max(per_model, key=lambda k: per_model[k]["conf"])
+            seg_img, cov = seg_overlay(img, cams[best])
+            entry["seg"] = {"img": seg_img, "cov": cov, "model": best}
+        if show_features:
+            entry["features"] = parametric_features(img)
         results.append(entry)
     progress.progress(1.0, text="Done")
     st.session_state["results"] = results
@@ -183,19 +217,17 @@ if "results" in st.session_state and st.session_state["results"]:
             st.image(r["original"], caption="Original scan")
         for i, (n, mres) in enumerate(r["models"].items()):
             with cols[i + 1]:
-                st.image(overlay(r["original"], r["cams"][n]),
-                         caption=f"{n}: {mres['label']} · {mres['conf']:.1%}")
+                heat = r.get("overlays", {}).get(n) or overlay(r["original"], r["cams"][n])
+                st.image(heat, caption=f"{n}: {mres['label']} · {mres['conf']:.1%}")
                 st.bar_chart(pd.Series(mres["probs"], name="probability"))
-        if show_seg and r["cams"]:
-            best = max(r["models"], key=lambda n: r["models"][n]["conf"])
-            seg_img, cov = seg_overlay(r["original"], r["cams"][best])
-            st.image(seg_img,
-                     caption=f"Approx. localisation ({best}, top-quartile activation, "
-                             f"{cov:.1%} of image highlighted)")
+        if show_seg and r.get("seg"):
+            s = r["seg"]
+            st.image(s["img"],
+                     caption=f"Approx. localisation ({s['model']}, top-quartile activation, "
+                             f"{s['cov']:.1%} of image highlighted)")
         if show_features:
             with st.expander("Parametric / structural features"):
-                feats = parametric_features(r["original"])
-                st.json(feats)
+                st.json(r.get("features") or parametric_features(r["original"]))
 
     st.subheader("📋 Comparison & Report")
     rows = []

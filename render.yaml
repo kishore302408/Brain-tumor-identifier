@@ -3,7 +3,7 @@ services:
     name: brain-tumor-identifier
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    startCommand: python -m streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.maxUploadSize 20 --browser.gatherUsageStats false
     envVars:
       - key: PYTHON_VERSION
         value: 3.10.0
