@@ -60,7 +60,7 @@ def warm_state():
 def _do_warmup():
     s = warm_state()
     try:
-        s["phase"] = "importing PyTorch…"
+        s["phase"] = "importing PyTorch + model code…"
         get_backend()
         s["phase"] = "loading resnet18 weights…"
         load_model("resnet18")
