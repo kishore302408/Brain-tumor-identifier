@@ -53,17 +53,27 @@ def load_model(name):
 # ---------------- Warm-up: load torch + default model in the background so the
 # first "Analyze" click is instant instead of waiting10-20s ----------------
 @st.cache_resource(show_spinner=False)
-def _warmup():
+def warm_state():
+    """Warm-up status dict — persists across Streamlit reruns and sessions."""
+    return {"phase": "starting…", "ready": False, "ok": False}
+
+def _do_warmup():
+    s = warm_state()
     try:
+        s["phase"] = "importing PyTorch…"
         get_backend()
+        s["phase"] = "loading resnet18 weights…"
         load_model("resnet18")
-    except Exception:
-        return False
-    return True
+        s.update(phase="ready", ready=True, ok=True)
+        print("[warmup] backend ready", flush=True)
+    except Exception as e:
+        s.update(phase=f"failed ({type(e).__name__})", ready=True, ok=False)
+        print(f"[warmup] failed: {e}", flush=True)
 
 @st.cache_resource(show_spinner=False)
 def _kick_warmup():
-    threading.Thread(target=_warmup, daemon=True).start()
+    warm_state()  # create the shared dict in the main thread first
+    threading.Thread(target=_do_warmup, daemon=True).start()
     return True
 
 _kick_warmup()  # runs once per server process, non-blocking
@@ -127,8 +137,19 @@ with st.sidebar:
                                 accept_multiple_files=True)
     analyze = st.button("🔍 Analyze scans", type="primary",
                         disabled=not uploaded, use_container_width=True)
-    st.caption("⚡ Models preload in the background — analysis is fast. "
-               "First visit after idle may still take ~1 minute to wake up.")
+
+    @st.fragment(run_every=5)
+    def backend_status():
+        """Live indicator — updates itself while the backend preloads."""
+        s = warm_state()
+        if not s.get("ready"):
+            st.caption(f"⏳ Preloading AI backend — {s.get('phase', '…')}")
+        elif s.get("ok"):
+            st.caption("⚡ Backend ready — analysis will be fast")
+        else:
+            st.caption("ℹ️ Backend will load on first analysis.")
+
+    backend_status()
 
 # ---------------- Model performance (instant) ----------------
 st.subheader("📊 Model Performance")
@@ -166,22 +187,26 @@ else:
 # ---------------- Analysis ----------------
 if analyze and uploaded:
     selected = NAMES if model_choice == "All + Ensemble" else [model_choice.split(" ")[0]]
-    progress = st.progress(0, text="Loading backend…")
+    w = warm_state()
+    progress = st.progress(0.0, text=(
+        f"Preparing AI backend — {w.get('phase', '…')}" if not w.get("ready")
+        else "Backend ready — starting analysis…"))
+    torch, tf, _, _ = get_backend()  # blocks only if warm-up is still running
     results = []
     total = len(uploaded)
     for ui, f in enumerate(uploaded):
-        torch, tf, _, _ = get_backend()
         img = Image.open(f).convert("RGB")
         img.thumbnail((1024, 1024), RESAMPLE)  # keep CPU/memory low on the free tier
         x = tf(img).unsqueeze(0)
         per_model, cams = {}, {}
         for mi, n in enumerate(selected):
-            progress.progress((ui + mi / max(len(selected), 1)) / total,
-                              text=f"Running {n} on {f.name}…")
+            frac = (ui + mi / max(len(selected), 1)) / total
+            progress.progress(frac, text=f"Loading {n} model…")
             m = load_model(n)
             if m is None:
                 st.warning(f"No trained weights found for {n} — skipped.")
                 continue
+            progress.progress(frac, text=f"Analyzing {f.name} with {n} (Grad-CAM)…")
             p, cam = gradcam(m, n, x)
             per_model[n] = {"label": CLASSES[int(p.argmax())], "conf": float(p.max()),
                             "probs": {c: float(v) for c, v in zip(CLASSES, p.tolist())}}
